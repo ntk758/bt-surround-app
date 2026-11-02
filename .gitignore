@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# PyInstaller の生成物 (build.bat で再生成できる)
+build/
+dist/
+*.spec
+
+# 環境ごとのデバイス設定
+device_config.json
