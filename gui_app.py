@@ -7,6 +7,11 @@ from dsp import (
     Position3D, Speaker3D, SpeakerLayout3D, VBAP2D, VBAP3D,
     CartesianLerpTrajectory, DirectionSlerpTrajectory, WaypointTrajectory
 )
+from dsp import DriftCompensatedBuffer, load_settings, save_settings
+from device_monitor import StreamWatch, device_is_present
+from multi_engine import MultiSpeakerEngine
+from spatial_audio import BedConfig, SpeakerSpec, SPEAKER_TEMPLATES, SUPPORTED_INPUT_CHANNELS
+from sofa_loader import SOFALoader
 from main import (
     HOST_API_CAPTURE, HOST_API_FRONT, HOST_API_REAR,
     DEVICE_NAME_CAPTURE, DEVICE_NAME_FRONT, DEVICE_NAME_REAR,
@@ -22,6 +27,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 import tkinter.messagebox as messagebox
+import tkinter.filedialog as filedialog
 
 try:
     import sounddevice as sd
@@ -146,6 +152,9 @@ class AudioEngine:
         self.is_running = False
         self.cfg = None
         self.keep_alive_enabled = False
+        self.drift_enabled = True
+        self.watch = StreamWatch()
+        self._drift_buffers = []
         self._keepalive_phase = 0.0
         self._keepalive_phase2 = 0.0
         self.front_rms_l = 0.0
@@ -157,6 +166,13 @@ class AudioEngine:
     def get_rms_levels(self) -> tuple[float, float, float]:
         with self._rms_lock:
             return self.front_rms_l, self.front_rms_r, self.rear_rms
+
+    def lost_outputs(self) -> list[str]:
+        """止まったストリームの役割名 (capture / front / rear / rear2) を返す。"""
+        return self.watch.lost() if self.is_running else []
+
+    def drift_ppm(self) -> list[tuple[str, float]]:
+        return [(name, buf.drift_ppm) for name, buf in self._drift_buffers]
 
     def get_rear2_rms(self) -> float | None:
         """第2リアのRMS。第2リアを使っていない場合は None。"""
@@ -206,7 +222,8 @@ class AudioEngine:
     ):
         cap_info = sd.query_devices(capture_idx)
         front_info = sd.query_devices(front_idx)
-        rear_info = sd.query_devices(rear_idx)
+        # rear_idx=None: リアが切断中。フロントだけ再生を続ける
+        rear_info = sd.query_devices(rear_idx) if rear_idx is not None else None
 
         # キャプチャチャンネル数の決定
         n_channels = CAPTURE_CHANNELS
@@ -216,10 +233,10 @@ class AudioEngine:
 
         capture_rate = int(cap_info["default_samplerate"])
         front_rate = int(front_info["default_samplerate"])
-        rear_rate = int(rear_info["default_samplerate"])
+        rear_rate = int(rear_info["default_samplerate"]) if rear_info else PROCESS_SAMPLE_RATE
 
         front_channels = max(1, min(2, int(front_info.get("max_output_channels", 2))))
-        rear_channels = max(1, min(REAR_STREAM_CHANNELS, int(rear_info.get("max_output_channels", REAR_STREAM_CHANNELS))))
+        rear_channels = max(1, min(REAR_STREAM_CHANNELS, int(rear_info["max_output_channels"]))) if rear_info else 1
 
         capture_to_process = StreamResampler(capture_rate, PROCESS_SAMPLE_RATE)
         process_to_front = StreamResampler(PROCESS_SAMPLE_RATE, front_rate)
@@ -252,8 +269,10 @@ class AudioEngine:
         )
         processor = SurroundProcessor(self.cfg)
 
-        front_buf = _AudioBuffer(max_frames=front_rate // 4)
-        rear_buf = _AudioBuffer(max_frames=rear_rate // 4)
+        self.watch = StreamWatch()
+        front_buf = DriftCompensatedBuffer(front_rate, max_frames=front_rate // 4, enabled=self.drift_enabled)
+        rear_buf = DriftCompensatedBuffer(rear_rate, max_frames=rear_rate // 4, enabled=self.drift_enabled and rear_info is not None)
+        self._drift_buffers = [("Front", front_buf), ("Rear", rear_buf)]
 
         capture_q = queue.Queue(maxsize=CAPTURE_QUEUE_MAXSIZE)
         self.stop_event = threading.Event()
@@ -261,6 +280,7 @@ class AudioEngine:
         self._keepalive_phase2 = 0.0
 
         def front_output_callback(outdata, frames, time_info, status):
+            self.watch.touch("front")
             data = front_buf.read(frames, front_channels)
             outdata[:] = data
             rms_l = _compute_rms(data[:, 0]) if data.shape[1] > 0 else 0.0
@@ -270,6 +290,7 @@ class AudioEngine:
                 self.front_rms_r = rms_r
 
         def rear_output_callback(outdata, frames, time_info, status):
+            self.watch.touch("rear")
             data = rear_buf.read(frames, rear_channels)
             if self.keep_alive_enabled:
                 signal = _generate_keepalive_signal(
@@ -288,21 +309,26 @@ class AudioEngine:
             device=front_idx, samplerate=front_rate, channels=front_channels,
             blocksize=0, dtype="float32", callback=front_output_callback,
         )
-        self.rear_stream = sd.OutputStream(
-            device=rear_idx, samplerate=rear_rate, channels=rear_channels,
-            blocksize=0, dtype="float32", callback=rear_output_callback,
-        )
+        self.watch.register("front", self.front_stream)
         self.front_stream.start()
-        self.rear_stream.start()
+        if rear_info is not None:
+            self.rear_stream = sd.OutputStream(
+                device=rear_idx, samplerate=rear_rate, channels=rear_channels,
+                blocksize=0, dtype="float32", callback=rear_output_callback,
+            )
+            self.watch.register("rear", self.rear_stream)
+            self.rear_stream.start()
 
         if rear_stereo:
             rear2_info = sd.query_devices(rear2_idx)
             rear2_rate = int(rear2_info["default_samplerate"])
             rear2_channels = max(1, min(REAR_STREAM_CHANNELS, int(rear2_info.get("max_output_channels", REAR_STREAM_CHANNELS))))
             process_to_rear2 = StreamResampler(PROCESS_SAMPLE_RATE, rear2_rate)
-            rear2_buf = _AudioBuffer(max_frames=rear2_rate // 4)
+            rear2_buf = DriftCompensatedBuffer(rear2_rate, max_frames=rear2_rate // 4, enabled=self.drift_enabled)
+            self._drift_buffers.append(("Rear 2", rear2_buf))
 
             def rear2_output_callback(outdata, frames, time_info, status):
+                self.watch.touch("rear2")
                 data = rear2_buf.read(frames, rear2_channels)
                 if self.keep_alive_enabled:
                     signal = _generate_keepalive_signal(
@@ -321,6 +347,7 @@ class AudioEngine:
                 device=rear2_idx, samplerate=rear2_rate, channels=rear2_channels,
                 blocksize=0, dtype="float32", callback=rear2_output_callback,
             )
+            self.watch.register("rear2", self.rear2_stream)
             self.rear2_stream.start()
         else:
             self.rear2_stream = None
@@ -337,6 +364,7 @@ class AudioEngine:
         self.proc_t.start()
 
         def capture_callback(indata, frames, time_info, status):
+            self.watch.touch("capture")
             block = indata.copy().astype(np.float32)
             if n_channels == 1:
                 block = np.repeat(block, 2, axis=1)  # モノラル入力はステレオとして処理
@@ -352,6 +380,7 @@ class AudioEngine:
             device=capture_idx, samplerate=capture_rate, channels=n_channels,
             blocksize=INPUT_BLOCK_SIZE, dtype="float32", callback=capture_callback,
         )
+        self.watch.register("capture", self.in_stream)
         self.in_stream.start()
 
     def stop(self):
@@ -875,6 +904,25 @@ class SurroundGUI:
         self.root.geometry("620x680")
 
         self.engine = AudioEngine()
+        self.multi_engine = MultiSpeakerEngine()
+
+        # 再生モード: legacy (フロント+リア) / speakers (3D複数台) / binaural (SOFAヘッドホン)
+        self.render_mode_var = tk.StringVar(value="legacy")
+        self.capture_ch_var = tk.StringVar(value="2")
+        self.surround_gain_var = tk.DoubleVar(value=1.0)
+        self.height_gain_var = tk.DoubleVar(value=0.7)
+        self.lower_gain_var = tk.DoubleVar(value=0.4)
+        self.sofa_path_var = tk.StringVar(value="")
+        self.auto_reconnect_var = tk.BooleanVar(value=True)
+        self.drift_var = tk.BooleanVar(value=True)
+        self.speakers: list[SpeakerSpec] = []
+        self._sofa_cache = (None, None)
+
+        # 切断監視: 再生を続けたいか / 切断中のデバイス {役割: 表示名}
+        self._want_running = False
+        self._lost: dict[str, str] = {}
+        self._reconnect_tick = 0
+        self._save_job = None
 
         # Variables
         self.mode_var = tk.StringVar(value="delay_lpf")
@@ -954,6 +1002,7 @@ class SurroundGUI:
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self._restore_settings()
 
         # Start visualizer update loop
         self.root.after(100, self._update_visualizer)
@@ -961,6 +1010,7 @@ class SurroundGUI:
         # Load devices and auto-select
         self.refresh_devices()
         self.root.after(200, self.auto_start)
+        self.root.after(1000, self._watchdog)
 
     def create_widgets(self):
         self.notebook = ttk.Notebook(self.root)
@@ -969,6 +1019,7 @@ class SurroundGUI:
         # Tabs
         self.tab_main = ttk.Frame(self.notebook)
         self.tab_equalizer = ttk.Frame(self.notebook)
+        self.tab_speakers = ttk.Frame(self.notebook)
         self.tab_room_map = ttk.Frame(self.notebook)
         self.tab_wifi = ttk.Frame(self.notebook)
         self.tab_visualizer = ttk.Frame(self.notebook)
@@ -977,6 +1028,7 @@ class SurroundGUI:
         self.tab_help = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_main, text="Main Control")
+        self.notebook.add(self.tab_speakers, text="3D Speakers")
         self.notebook.add(self.tab_equalizer, text="Equalizer")
         self.notebook.add(self.tab_room_map, text="Room Map (2D)")
         self.notebook.add(self.tab_wifi, text="Wi-Fi Speaker")
@@ -986,6 +1038,7 @@ class SurroundGUI:
         self.notebook.add(self.tab_help, text="How to Use")
 
         self.build_main_tab()
+        self.build_speakers_tab()
         self.build_equalizer_tab()
         self.build_room_map_tab()
         self.build_wifi_tab()
@@ -1109,6 +1162,369 @@ class SurroundGUI:
             variable=self.tray_var,
         )
         self.cb_tray.pack(side=tk.LEFT, padx=5)
+
+        opt2_f = ttk.Frame(f)
+        opt2_f.pack(fill=tk.X, pady=(5, 0))
+        ttk.Checkbutton(
+            opt2_f, text="切断時に自動再接続", variable=self.auto_reconnect_var, command=self._schedule_save,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            opt2_f, text="同期ずれ自動補正", variable=self.drift_var, command=self.on_drift_change,
+        ).pack(side=tk.LEFT, padx=5)
+
+    def build_speakers_tab(self):
+        f = ttk.Frame(self.tab_speakers, padding="10")
+        f.pack(fill=tk.BOTH, expand=True)
+
+        mode_row = ttk.LabelFrame(f, text="再生モード (変更すると再生し直します)", padding="6")
+        mode_row.pack(fill=tk.X)
+        for text, val in [("フロント+リア (従来)", "legacy"), ("3D 複数スピーカー", "speakers"), ("ヘッドホン (SOFA HRTF)", "binaural")]:
+            ttk.Radiobutton(mode_row, text=text, value=val, variable=self.render_mode_var, command=self.on_render_mode_change).pack(side=tk.LEFT, padx=5)
+
+        input_row = ttk.Frame(f)
+        input_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(input_row, text="入力ch (3Dモード):").pack(side=tk.LEFT)
+        cb_ch = ttk.Combobox(input_row, textvariable=self.capture_ch_var, state="readonly", width=4,
+                             values=[str(c) for c in SUPPORTED_INPUT_CHANNELS if c > 1])
+        cb_ch.pack(side=tk.LEFT, padx=5)
+        cb_ch.bind("<<ComboboxSelected>>", lambda e: self.on_render_mode_change())
+        ttk.Label(input_row, text="12ch は 7.1.4 (L R C LFE BL BR SL SR TFL TFR TBL TBR)", foreground="gray").pack(side=tk.LEFT)
+
+        gains = ttk.Frame(f)
+        gains.pack(fill=tk.X, pady=(8, 0))
+        for i, (text, var) in enumerate([("サラウンド", self.surround_gain_var), ("上方", self.height_gain_var), ("下方", self.lower_gain_var)]):
+            ttk.Label(gains, text=text).grid(row=0, column=i * 2, padx=(8, 2))
+            ttk.Scale(gains, from_=0.0, to=2.0, variable=var, orient=tk.HORIZONTAL, command=self.on_setting_change).grid(row=0, column=i * 2 + 1, sticky="ew")
+            gains.columnconfigure(i * 2 + 1, weight=1)
+
+        sofa_row = ttk.Frame(f)
+        sofa_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(sofa_row, text="SOFA ファイル:").pack(side=tk.LEFT)
+        ttk.Entry(sofa_row, textvariable=self.sofa_path_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(sofa_row, text="参照...", command=self._browse_sofa).pack(side=tk.LEFT)
+        ttk.Label(f, text="ヘッドホンモードの出力先は Device Settings の Front デバイスです。", foreground="gray").pack(anchor=tk.W)
+
+        columns = ("name", "device", "ch", "az", "el", "dist", "gain", "delay", "lfe")
+        headings = ("名前", "デバイス", "ch", "方位°", "仰角°", "距離m", "音量", "遅延ms", "Sub")
+        widths = (50, 190, 35, 45, 45, 45, 40, 50, 35)
+        self.spk_tree = ttk.Treeview(f, columns=columns, show="headings", height=7, selectmode="browse")
+        for col, head, width in zip(columns, headings, widths):
+            self.spk_tree.heading(col, text=head)
+            self.spk_tree.column(col, width=width, anchor=tk.W if col in ("name", "device") else tk.CENTER)
+        self.spk_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 4))
+        self.spk_tree.bind("<<TreeviewSelect>>", self._on_speaker_select)
+
+        form = ttk.Frame(f)
+        form.pack(fill=tk.X)
+        self.spk_fields = {}
+        for i, (key, text, default, width) in enumerate([
+            ("name", "名前", "SP", 7), ("azimuth", "方位° (右+)", "0", 6), ("elevation", "仰角° (上+)", "0", 6),
+            ("distance", "距離m", "2.0", 5), ("gain", "音量", "1.0", 5), ("delay_ms", "遅延ms", "0", 6),
+        ]):
+            ttk.Label(form, text=text).grid(row=0, column=i, sticky=tk.W, padx=2)
+            var = tk.StringVar(value=default)
+            ttk.Entry(form, textvariable=var, width=width).grid(row=1, column=i, padx=2)
+            self.spk_fields[key] = var
+        self.spk_lfe_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Sub", variable=self.spk_lfe_var).grid(row=1, column=6, padx=2)
+
+        form2 = ttk.Frame(f)
+        form2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(form2, text="デバイス:").pack(side=tk.LEFT)
+        self.spk_device_var = tk.StringVar(value="")
+        self.cb_spk_device = ttk.Combobox(form2, textvariable=self.spk_device_var, state="readonly", width=38)
+        self.cb_spk_device.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Label(form2, text="ch:").pack(side=tk.LEFT)
+        self.spk_channel_var = tk.StringVar(value="全")
+        ttk.Combobox(form2, textvariable=self.spk_channel_var, state="readonly", width=4, values=["全", "L", "R"]).pack(side=tk.LEFT, padx=4)
+
+        btns = ttk.Frame(f)
+        btns.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btns, text="追加", command=self._speaker_add).pack(side=tk.LEFT)
+        ttk.Button(btns, text="更新", command=self._speaker_update).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="削除", command=self._speaker_delete).pack(side=tk.LEFT)
+        ttk.Button(btns, text="遅延を自動測定", command=self._calibrate_speakers).pack(side=tk.LEFT, padx=(12, 0))
+        self.spk_template_var = tk.StringVar(value=next(iter(SPEAKER_TEMPLATES)))
+        ttk.Button(btns, text="テンプレート適用", command=self._apply_speaker_template).pack(side=tk.RIGHT)
+        ttk.Combobox(btns, textvariable=self.spk_template_var, state="readonly", width=16, values=list(SPEAKER_TEMPLATES)).pack(side=tk.RIGHT, padx=4)
+
+    # ---- 3D Speakers: 編集 ----
+    def _refresh_speaker_tree(self):
+        self.spk_tree.delete(*self.spk_tree.get_children())
+        channel_label = {-1: "全", 0: "L", 1: "R"}
+        for i, s in enumerate(self.speakers):
+            self.spk_tree.insert("", tk.END, iid=str(i), values=(
+                s.name, s.device or "(未設定)", channel_label.get(s.channel, s.channel), f"{s.azimuth:g}", f"{s.elevation:g}",
+                f"{s.distance:g}", f"{s.gain:g}", f"{s.delay_ms:g}", "✓" if s.is_lfe else "",
+            ))
+
+    def _on_speaker_select(self, event=None):
+        sel = self.spk_tree.selection()
+        if not sel:
+            return
+        s = self.speakers[int(sel[0])]
+        for key, var in self.spk_fields.items():
+            value = getattr(s, key)
+            var.set(value if isinstance(value, str) else f"{value:g}")
+        self.spk_lfe_var.set(s.is_lfe)
+        self.spk_device_var.set(s.device)
+        self.spk_channel_var.set({-1: "全", 0: "L", 1: "R"}.get(s.channel, "全"))
+
+    def _speaker_from_form(self, base: SpeakerSpec | None = None) -> SpeakerSpec | None:
+        try:
+            spec = SpeakerSpec(
+                name=self.spk_fields["name"].get().strip() or "SP",
+                device=self.spk_device_var.get(),
+                channel={"全": -1, "L": 0, "R": 1}[self.spk_channel_var.get()],
+                azimuth=float(self.spk_fields["azimuth"].get()),
+                elevation=max(-90.0, min(90.0, float(self.spk_fields["elevation"].get()))),
+                distance=max(0.1, float(self.spk_fields["distance"].get())),
+                gain=max(0.0, float(self.spk_fields["gain"].get())),
+                delay_ms=max(0.0, min(900.0, float(self.spk_fields["delay_ms"].get()))),
+                eq=base.eq if base else (0.0, 0.0, 0.0),
+                is_lfe=bool(self.spk_lfe_var.get()),
+            )
+        except ValueError:
+            messagebox.showerror("Error", "数値の入力が正しくありません。")
+            return None
+        return spec
+
+    def _speaker_add(self):
+        spec = self._speaker_from_form()
+        if spec:
+            self._set_speakers(self.speakers + [spec])
+
+    def _speaker_update(self):
+        sel = self.spk_tree.selection()
+        if not sel:
+            messagebox.showwarning("Warning", "更新するスピーカーを選択してください。")
+            return
+        idx = int(sel[0])
+        spec = self._speaker_from_form(self.speakers[idx])
+        if spec:
+            self._set_speakers(self.speakers[:idx] + [spec] + self.speakers[idx + 1:])
+
+    def _speaker_delete(self):
+        sel = self.spk_tree.selection()
+        if sel:
+            idx = int(sel[0])
+            self._set_speakers(self.speakers[:idx] + self.speakers[idx + 1:])
+
+    def _apply_speaker_template(self):
+        speakers = SPEAKER_TEMPLATES[self.spk_template_var.get()]()
+        # 左右チャンネル指定のあるものは同じデバイスを前提にフロントへ割り当てる
+        front = self.front_dev_var.get()
+        for s in speakers:
+            if s.channel >= 0:
+                s.device = front
+        self._set_speakers(speakers)
+
+    def _set_speakers(self, speakers: list[SpeakerSpec]):
+        self.speakers = speakers
+        self._refresh_speaker_tree()
+        self._schedule_save()
+        if self.multi_engine.is_running and self.render_mode_var.get() == "speakers":
+            if not self.speakers:
+                self.restart_engine()
+            elif not self.multi_engine.update_speakers(self._active_speakers()):
+                self.restart_engine()
+
+    def _browse_sofa(self):
+        path = filedialog.askopenfilename(title="SOFA ファイルを選択", filetypes=[("SOFA", "*.sofa"), ("All files", "*.*")])
+        if path:
+            self.sofa_path_var.set(path)
+            self._schedule_save()
+            if self.render_mode_var.get() == "binaural":
+                self.restart_engine()
+
+    def _load_sofa(self):
+        path = self.sofa_path_var.get()
+        if not path:
+            raise RuntimeError("3D Speakers タブで SOFA ファイルを選択してください。")
+        if self._sofa_cache[0] != path:
+            self._sofa_cache = (path, SOFALoader().load(path))
+        return self._sofa_cache[1]
+
+    def _bed_config(self) -> BedConfig:
+        return BedConfig(
+            surround_gain=float(self.surround_gain_var.get()),
+            height_gain=float(self.height_gain_var.get()),
+            lower_gain=float(self.lower_gain_var.get()),
+        )
+
+    def on_render_mode_change(self):
+        self._schedule_save()
+        self.restart_engine()
+
+    def on_drift_change(self):
+        self.engine.drift_enabled = bool(self.drift_var.get())
+        self._schedule_save()
+        self.restart_engine()
+
+    def _calibrate_speakers(self):
+        """デバイスごとの到達時間を測り、最も遅いデバイスに揃うよう遅延を設定する。"""
+        mic_id = self.get_selected_device_id("mic")
+        displays = list(dict.fromkeys(s.device for s in self.speakers if s.device))
+        if mic_id is None or not displays:
+            messagebox.showerror("Error", "マイクとスピーカーのデバイスを設定してください。")
+            return
+        was_running = self.running_var.get()
+        if was_running:
+            self.toggle_engine()
+
+        def _worker():
+            try:
+                latencies = {d: _measure_output_latency(self._resolve_output(d), mic_id, 2.0) for d in displays}
+            except Exception as e:
+                print(f"[calibrate] {e}", file=sys.stderr)
+                latencies = {}
+
+            def _done():
+                measured = {d: t for d, t in latencies.items() if t is not None}
+                if measured and len(measured) == len(displays):
+                    slowest = max(measured.values())
+                    for s in self.speakers:
+                        if s.device in measured:
+                            s.delay_ms = round(min(900.0, slowest - measured[s.device]), 1)
+                    self._set_speakers(list(self.speakers))
+                    messagebox.showinfo("Auto Calibration", "デバイスごとの遅延を設定しました。")
+                else:
+                    messagebox.showerror("Calibration Failed", "測定できないデバイスがありました。マイクの位置や音量を確認してください。")
+                if was_running:
+                    self.toggle_engine()
+
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ---- 設定の自動保存 ----
+    _SETTING_VARS = (
+        "mode_var", "hrtf_var", "gain_var", "gain2_var", "delay_var", "rear1_delay_var", "rear2_delay_var",
+        "keepalive_var", "hotkey_var", "tray_var", "front_bass_var", "front_mid_var", "front_treble_var",
+        "rear1_bass_var", "rear1_mid_var", "rear1_treble_var", "rear2_bass_var", "rear2_mid_var", "rear2_treble_var",
+        "render_mode_var", "capture_ch_var", "surround_gain_var", "height_gain_var", "lower_gain_var",
+        "sofa_path_var", "auto_reconnect_var", "drift_var",
+    )
+
+    def _collect_settings(self) -> dict:
+        settings = {name: getattr(self, name).get() for name in self._SETTING_VARS}
+        settings["room_objects"] = self.room_objects
+        settings["room_offsets"] = self._room_offsets
+        settings["speakers"] = [s.to_dict() for s in self.speakers]
+        return settings
+
+    def _restore_settings(self):
+        settings = load_settings()
+        for name in self._SETTING_VARS:
+            if name in settings:
+                var = getattr(self, name)
+                # 手で編集された/壊れた設定で起動不能にならないよう型を検証する
+                try:
+                    if isinstance(var, tk.DoubleVar):
+                        var.set(float(settings[name]))
+                    elif isinstance(var, tk.BooleanVar):
+                        var.set(bool(settings[name]))
+                    else:
+                        var.set(str(settings[name]))
+                except (tk.TclError, TypeError, ValueError):
+                    pass
+        if self.render_mode_var.get() not in ("legacy", "speakers", "binaural"):
+            self.render_mode_var.set("legacy")
+        if self.capture_ch_var.get() not in [str(c) for c in SUPPORTED_INPUT_CHANNELS]:
+            self.capture_ch_var.set("2")
+        rooms = settings.get("room_objects")
+        if isinstance(rooms, dict) and set(rooms) == set(self.room_objects):
+            self.room_objects = rooms
+        offsets = settings.get("room_offsets")
+        if isinstance(offsets, dict) and set(offsets) == set(self._room_offsets):
+            self._room_offsets = offsets
+        try:
+            self.speakers = [SpeakerSpec.from_dict(d) for d in settings.get("speakers", [])]
+        except (TypeError, ValueError, AttributeError):
+            self.speakers = []
+        self.engine.drift_enabled = bool(self.drift_var.get())
+        self.engine.keep_alive_enabled = bool(self.keepalive_var.get())
+        self._refresh_speaker_tree()
+        self._draw_room_map()
+        self.on_setting_change(save=False)
+        if not self.hotkey_var.get():
+            self.hotkeys.stop()
+
+    def _schedule_save(self, *args):
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(1000, self._save_now)
+
+    def _save_now(self):
+        self._save_job = None
+        save_settings(self._collect_settings())
+
+    # ---- 切断の検知と自動再接続 ----
+    def _watchdog(self):
+        try:
+            engine = self._active_engine()
+            if self._want_running and engine.is_running:
+                lost = engine.lost_outputs()
+                if lost:
+                    self._handle_lost(engine, lost)
+            if self._want_running and self._lost:
+                self._reconnect_tick += 1
+                if self._reconnect_tick >= 3:
+                    self._reconnect_tick = 0
+                    self._try_reconnect()
+        except Exception as e:
+            print(f"[watchdog] error: {e}", file=sys.stderr)
+        finally:
+            self.root.after(1000, self._watchdog)
+
+    def _role_display(self, role: str) -> str:
+        var = {"capture": self.capture_dev_var, "front": self.front_dev_var,
+               "rear": self.rear_dev_var, "rear2": self.rear2_dev_var}.get(role)
+        return var.get() if var is not None else role
+
+    def _handle_lost(self, engine, roles: list[str]):
+        for role in roles:
+            if role == "capture":
+                self._lost["capture"] = self.capture_dev_var.get()
+            else:
+                self._lost[role] = self._role_display(role)
+        engine.stop()
+        self.running_var.set(False)
+        if self.auto_reconnect_var.get():
+            self._start_engine(interactive=False)  # 残りのデバイスで再生を続ける
+        else:
+            self._want_running = False
+            self._lost.clear()
+            self.btn.config(text="Start Audio")
+            self.status_lbl.config(text="切断されました (Stopped)", foreground="red")
+
+    def _try_reconnect(self):
+        back = [role for role, display in self._lost.items() if device_is_present(display)]
+        if not back:
+            return
+        for role in back:
+            del self._lost[role]
+        # 再初期化で再生が途切れるため、戻ってきたデバイスがあるときだけ行う
+        self._active_engine().stop()
+        self.running_var.set(False)
+        self.refresh_devices()
+        self._start_engine(interactive=False)
+
+    def _active_engine(self):
+        return self.engine if self.render_mode_var.get() == "legacy" else self.multi_engine
+
+    def _resolve_output(self, display: str) -> int | None:
+        """表示名からデバイスIDを求める。IDがずれていても "[API] 名前" が同じなら同一とみなす。"""
+        key = re.sub(r"\s*\(ID:\s*\d+\)$", "", display)
+        for dev_id, disp, name, api in self.output_devices:
+            if disp == display or re.sub(r"\s*\(ID:\s*\d+\)$", "", disp) == key:
+                return dev_id
+        return None
+
+    def _active_speakers(self) -> list[SpeakerSpec]:
+        """切断中のデバイスを除いた再生対象。除外分は VBAP が残りのスピーカーへ割り振る。"""
+        lost = set(self._lost.values())
+        return [s for s in self.speakers if s.device not in lost]
 
     def build_equalizer_tab(self):
         f = ttk.Frame(self.tab_equalizer, padding="15")
@@ -1403,7 +1819,10 @@ class SurroundGUI:
                 self.root.state() != "withdrawn"
                 and self.notebook.select() == str(self.tab_visualizer)
             )
-            if visible:
+            if visible and self.multi_engine.is_running:
+                self._draw_multi_levels(self.multi_engine.get_levels())
+                self.vis_info_lbl.config(text=self._drift_text(self.multi_engine))
+            elif visible:
                 self._draw_visualizer(rms_l, rms_r, rear_rms, rear2_rms)
                 info = (
                     f"Front L: {rms_l:.2f} (Peak: {self.peak_front_l:.2f}) | "
@@ -1412,11 +1831,32 @@ class SurroundGUI:
                 )
                 if rear2_rms is not None:
                     info += f" | Rear 2: {rear2_rms:.2f}"
+                if self.engine.is_running and self.drift_var.get():
+                    info += "\n" + self._drift_text(self.engine)
                 self.vis_info_lbl.config(text=info)
         except Exception as e:
             print(f"[visualizer] error: {e}", file=sys.stderr)
         finally:
             self.root.after(100, self._update_visualizer)
+
+    @staticmethod
+    def _drift_text(engine) -> str:
+        return "同期補正: " + ", ".join(f"{name[:14]} {ppm:+.0f}ppm" for name, ppm in engine.drift_ppm())
+
+    def _draw_multi_levels(self, levels: list[tuple[str, float]]):
+        self.canvas.delete("all")
+        if not levels:
+            return
+        row_h = min(40, self.canvas_height // len(levels))
+        for i, (name, rms) in enumerate(levels):
+            y0 = i * row_h + 3
+            y1 = (i + 1) * row_h - 3
+            rms = max(0.0, min(1.0, rms))
+            self.canvas.create_text(8, (y0 + y1) / 2, text=name[:9], fill="#e2e8f0", font=("", 8, "bold"), anchor=tk.W)
+            self.canvas.create_rectangle(70, y0, 350, y1, fill="#162035", outline="#0e1726")
+            if rms > 0.0:
+                self.canvas.create_rectangle(70, y0, 70 + 280 * rms, y1, fill="#2ed573" if rms < 0.65 else "#ff4757", outline="")
+            self.canvas.create_text(358, (y0 + y1) / 2, text=f"{rms:.2f}", fill="#a0aec0", font=("", 8), anchor=tk.W)
 
     def _draw_visualizer(self, rms_l: float, rms_r: float, rear_rms: float, rear2_rms: float | None = None):
         self.canvas.delete("all")
@@ -1745,7 +2185,20 @@ class SurroundGUI:
 ・ 閉じるボタン [X] を押してもタスクトレイに最小化され、BGMやゲーム音声を邪魔せずバックグラウンドで動き続けます。
 ・ 音割れ防止スマートリミッター内蔵により、過大入力時も滑らかなサチュレーションで音割れを防止します。
 
-■ 8. 単体 .exe の作成 (NEW)
+■ 8. 3D 複数スピーカー / 上下サラウンド (3D Speakersタブ)
+・ 再生モードを「3D 複数スピーカー」にし、スピーカーごとにデバイス・方位角(右が+)・仰角(上が+)・距離を登録します。台数の制限はありません。
+・ 上下に置いたスピーカーがあれば実際に上下から鳴ります。なければ水平のスピーカーへ振り分けられます。
+・ 2 / 5.1 / 7.1 入力の上下成分は残響から生成します。12ch (7.1.4) 入力の上方4chはそのまま使います。
+
+■ 9. ヘッドホン (SOFA HRTF)
+・ SOFAファイル(SimpleFreeFieldHRIR)を選ぶと、上下を含む立体音響をヘッドホンで再生します。
+
+■ 10. 自動機能
+・ 設定はすべて自動保存され、次回起動時に復元されます。
+・ 切断したスピーカーは検知され、残りのスピーカーで再生を続け、戻ると自動で再接続します(再接続の瞬間は音が途切れます)。
+・ デバイス間の同期ずれは再生速度の微調整で自動補正します。
+
+■ 11. 単体 .exe の作成 (NEW)
 ・ フォルダ内の「build.bat」をダブルクリックするだけで、Python不要の単体実行ファイル (dist/BT_Surround_App.exe) が自動生成されます。
 """
         text.insert(tk.END, help_content)
@@ -1783,14 +2236,16 @@ class SurroundGUI:
         # 保存された設定があれば復元、なければデフォルトマッチング
         self.restore_device_selection()
         self.update_rear2_ui()
+        self.cb_spk_device["values"] = [d[1] for d in self.output_devices]
 
     def restore_device_selection(self):
         saved = load_device_config()
+        self._saved_devices = saved
 
         def strip_id(display: str) -> str:
             return re.sub(r"\s*\(ID:\s*\d+\)$", "", display)
 
-        def _match_and_set(cb, var, dev_list, saved_str, name_frag, api_frag, allow_none=False):
+        def _match_and_set(cb, var, dev_list, saved_str, name_frag, api_frag, allow_none=False, role=None):
             if not dev_list:
                 if allow_none:
                     cb["values"] = ["(None)"]
@@ -1813,6 +2268,9 @@ class SurroundGUI:
                         var.set(d)
                         cb.set(d)
                         return
+                # 保存済みデバイスが未接続: 別デバイスで代用せず再接続を待つ
+                if role and saved_str != "(None)" and self.auto_reconnect_var.get():
+                    self._lost[role] = saved_str
 
             # allow_none の場合はデフォルトで (None)
             if allow_none:
@@ -1829,10 +2287,10 @@ class SurroundGUI:
                 var.set(vals[0])
                 cb.set(vals[0])
 
-        _match_and_set(self.cb_capture, self.capture_dev_var, self.input_devices, saved.get("capture"), DEVICE_NAME_CAPTURE, HOST_API_CAPTURE)
-        _match_and_set(self.cb_front, self.front_dev_var, self.output_devices, saved.get("front"), DEVICE_NAME_FRONT, HOST_API_FRONT)
-        _match_and_set(self.cb_rear, self.rear_dev_var, self.output_devices, saved.get("rear"), DEVICE_NAME_REAR, HOST_API_REAR)
-        _match_and_set(self.cb_rear2, self.rear2_dev_var, self.output_devices, saved.get("rear2"), "", "", allow_none=True)
+        _match_and_set(self.cb_capture, self.capture_dev_var, self.input_devices, saved.get("capture"), DEVICE_NAME_CAPTURE, HOST_API_CAPTURE, role="capture")
+        _match_and_set(self.cb_front, self.front_dev_var, self.output_devices, saved.get("front"), DEVICE_NAME_FRONT, HOST_API_FRONT, role="front")
+        _match_and_set(self.cb_rear, self.rear_dev_var, self.output_devices, saved.get("rear"), DEVICE_NAME_REAR, HOST_API_REAR, role="rear")
+        _match_and_set(self.cb_rear2, self.rear2_dev_var, self.output_devices, saved.get("rear2"), "", "", allow_none=True, role="rear2")
         _match_and_set(self.cb_mic, self.mic_dev_var, self.input_devices, saved.get("mic"), "mic", "")
 
     def _find_best_match(self, dev_list, name_frag, api_frag):
@@ -1867,9 +2325,14 @@ class SurroundGUI:
             "rear2": self.rear2_dev_var.get(),
             "mic": self.mic_dev_var.get(),
         }
+        # 切断中のデバイスは代用品で上書きせず、元の選択を覚えておく
+        for role, display in self._lost.items():
+            if role in config:
+                config[role] = display
         save_device_config(config)
 
     def on_device_selected(self, dev_type: str):
+        self._lost.pop(dev_type, None)  # ユーザーが選び直したら再接続待ちを解除
         self.save_current_device_selection()
         self.update_rear2_ui()
         if self.running_var.get():
@@ -1877,7 +2340,7 @@ class SurroundGUI:
             self.root.after(50, self.restart_engine)
 
     def restart_engine(self):
-        if self.running_var.get():
+        if self.running_var.get() or self._want_running:
             self.toggle_engine() # 停止
             self.root.after(100, self.toggle_engine) # 新設定で起動
 
@@ -2006,7 +2469,11 @@ class SurroundGUI:
         elif val == "full_mix": return AmbientMode.FULL_MIX
         return AmbientMode.DELAY_LPF
 
-    def on_setting_change(self, *args):
+    def on_setting_change(self, *args, save=True):
+        if save:
+            self._schedule_save()
+        if self.multi_engine.is_running:
+            self.multi_engine.update_bed(self._bed_config())
         self.gain_val_lbl.config(text=f"{self.gain_var.get():.2f}")
         self.gain2_val_lbl.config(text=f"{self.gain2_var.get():.2f}")
         self.rear1_delay_val_lbl.config(text=f"{int(self.rear1_delay_var.get())}")
@@ -2031,47 +2498,126 @@ class SurroundGUI:
         self.engine.keep_alive_enabled = self.keepalive_var.get()
 
     def toggle_engine(self):
-        if self.running_var.get():
-            self.engine.stop()
+        if self.running_var.get() or self._want_running:
+            self._want_running = False
+            self._lost = {}
+            self._active_engine().stop()
             self.running_var.set(False)
             self.btn.config(text="Start Audio")
             self.status_lbl.config(text="Stopped", foreground="red")
         else:
-            c_id = self.get_selected_device_id("capture")
-            f_id = self.get_selected_device_id("front")
-            r_id = self.get_selected_device_id("rear")
-            r2_id = self.get_selected_device_id("rear2")
+            self._want_running = True
+            self._start_engine(interactive=True)
 
-            if None in (c_id, f_id, r_id):
+    def _start_engine(self, interactive: bool) -> bool:
+        """現在の設定で再生を開始する。切断中のデバイスは除外し、再接続を待つ。"""
+        self.engine.keep_alive_enabled = self.keepalive_var.get()
+        self.multi_engine.keep_alive_enabled = self.keepalive_var.get()
+        mode = self.render_mode_var.get()
+        try:
+            started = self._start_legacy(interactive) if mode == "legacy" else self._start_multi(mode, interactive)
+        except Exception as e:
+            self._active_engine().stop()
+            self._want_running = self._want_running and not interactive
+            self.btn.config(text="Start Audio" if not self._want_running else "Stop Audio")
+            self.status_lbl.config(text="Stopped" if not self._want_running else "⚠ 再接続を待機中", foreground="red")
+            if interactive:
+                messagebox.showerror("Error", str(e))
+            else:
+                print(f"[engine] start failed: {e}", file=sys.stderr)
+            return False
+
+        self.btn.config(text="Stop Audio" if self._want_running else "Start Audio")
+        if not started:
+            waiting = self._want_running
+            self.status_lbl.config(text="⚠ 再接続を待機中" if waiting else "Stopped", foreground="#d97706" if waiting else "red")
+            return False
+        self.running_var.set(True)
+        if self._lost:
+            names = ", ".join(self._lost)
+            self.status_lbl.config(text=f"Running (切断中: {names})", foreground="#d97706")
+        else:
+            self.status_lbl.config(text="Running", foreground="green")
+        return True
+
+    def _start_legacy(self, interactive: bool) -> bool:
+        c_id = self.get_selected_device_id("capture")
+        f_id = self.get_selected_device_id("front")
+        r_id = self.get_selected_device_id("rear")
+        r2_id = self.get_selected_device_id("rear2")
+
+        if "capture" in self._lost or "front" in self._lost:
+            return False  # 入力かフロントがなければ再生できない
+        if "rear2" in self._lost:
+            r2_id = None
+        if "rear" in self._lost:
+            r_id, r2_id = r2_id, None  # 第2リアがあれば繰り上げ、なければフロントのみで再生
+
+        if c_id is None or f_id is None or (r_id is None and "rear" not in self._lost):
+            if interactive:
+                self._want_running = False
+                self.btn.config(text="Start Audio")
                 messagebox.showerror("Error", "デバイスをすべて選択してください。")
                 self.notebook.select(self.tab_devices)
-                return
+            return False
 
-            try:
-                self.engine.keep_alive_enabled = self.keepalive_var.get()
-                self.engine.start(
-                    capture_idx=c_id,
-                    front_idx=f_id,
-                    rear_idx=r_id,
-                    rear2_idx=r2_id,
-                    ambient_mode=self.get_enum_mode(),
-                    rear_gain=self.gain_var.get(),
-                    rear2_gain=self.gain2_var.get(),
-                    front_delay_ms=self.delay_var.get(),
-                    rear_delay_ms=self.rear1_delay_var.get(),
-                    rear2_delay_ms=self.rear2_delay_var.get(),
-                    hrtf_enabled=self.hrtf_var.get(),
-                    front_eq=(self.front_bass_var.get(), self.front_mid_var.get(), self.front_treble_var.get()),
-                    rear_eq=(self.rear1_bass_var.get(), self.rear1_mid_var.get(), self.rear1_treble_var.get()),
-                    rear2_eq=(self.rear2_bass_var.get(), self.rear2_mid_var.get(), self.rear2_treble_var.get()),
-                    wifi_server=self.wifi_server,  # 配信可否は処理スレッドが is_running で毎回判定
-                )
-                self.running_var.set(True)
-                self.btn.config(text="Stop Audio")
-                self.status_lbl.config(text="Running", foreground="green")
-            except Exception as e:
-                messagebox.showerror("Error", str(e))
-                self.engine.stop()
+        self.engine.start(
+            capture_idx=c_id,
+            front_idx=f_id,
+            rear_idx=r_id,
+            rear2_idx=r2_id,
+            ambient_mode=self.get_enum_mode(),
+            rear_gain=self.gain_var.get(),
+            rear2_gain=self.gain2_var.get(),
+            front_delay_ms=self.delay_var.get(),
+            rear_delay_ms=self.rear1_delay_var.get(),
+            rear2_delay_ms=self.rear2_delay_var.get(),
+            hrtf_enabled=self.hrtf_var.get(),
+            front_eq=(self.front_bass_var.get(), self.front_mid_var.get(), self.front_treble_var.get()),
+            rear_eq=(self.rear1_bass_var.get(), self.rear1_mid_var.get(), self.rear1_treble_var.get()),
+            rear2_eq=(self.rear2_bass_var.get(), self.rear2_mid_var.get(), self.rear2_treble_var.get()),
+            wifi_server=self.wifi_server,  # 配信可否は処理スレッドが is_running で毎回判定
+        )
+        return True
+
+    def _start_multi(self, mode: str, interactive: bool) -> bool:
+        c_id = self.get_selected_device_id("capture")
+        if "capture" in self._lost:
+            return False
+        if c_id is None:
+            raise RuntimeError("Device Settings タブで入力デバイスを選択してください。")
+
+        dataset, headphone, speakers = None, None, []
+        if mode == "binaural":
+            dataset = self._load_sofa()
+            headphone = self.front_dev_var.get()
+            if self._resolve_output(headphone) is None:
+                raise RuntimeError("Device Settings タブで Front デバイスを選択してください。")
+            if headphone in self._lost.values():
+                return False
+        else:
+            if not self.speakers:
+                raise RuntimeError("3D Speakers タブでスピーカーを追加してください。")
+            for s in self.speakers:
+                if not s.device:
+                    raise RuntimeError(f"スピーカー '{s.name}' のデバイスが未設定です。")
+                if self._resolve_output(s.device) is None:
+                    self._lost[s.device] = s.device  # 未接続なら再接続を待つ
+            speakers = self._active_speakers()
+            if not speakers:
+                return False
+
+        self.multi_engine.start(
+            capture_idx=c_id,
+            capture_channels=int(self.capture_ch_var.get()),
+            speakers=speakers,
+            resolve_output=self._resolve_output,
+            bed_config=self._bed_config(),
+            dataset=dataset,
+            headphone_device=headphone,
+            drift_enabled=bool(self.drift_var.get()),
+        )
+        return True
 
     def auto_start(self):
         # UI初期化後に自動スタート
@@ -2110,8 +2656,12 @@ class SurroundGUI:
         self.hotkeys.stop()
         self.tray.stop()
         self.wifi_server.stop()
-        if self.running_var.get():
-            self.engine.stop()
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+            self._save_job = None
+        save_settings(self._collect_settings())
+        self.engine.stop()
+        self.multi_engine.stop()
         self.root.destroy()
 
     def on_closing(self):

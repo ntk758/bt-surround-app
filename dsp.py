@@ -463,6 +463,116 @@ class _AudioBuffer:
             return self._frames
 
 
+class _VariableRateResampler:
+    """再生速度をごくわずかに変えるための可変比率リサンプラー (16タップ窓付きsinc)。
+    比率 1.0 付近で使う前提で、アンチエイリアスの帯域制限は行わない。"""
+
+    TAPS = 16
+    PHASES = 512
+    _table = None
+
+    def __init__(self):
+        if _VariableRateResampler._table is None:
+            center = self.TAPS // 2 - 1
+            t = np.arange(self.TAPS)[np.newaxis, :] - center - np.arange(self.PHASES + 1)[:, np.newaxis] / self.PHASES
+            table = np.sinc(t) * np.i0(8.0 * np.sqrt(np.clip(1.0 - (t / (self.TAPS / 2)) ** 2, 0.0, 1.0))) / np.i0(8.0)
+            _VariableRateResampler._table = table / table.sum(axis=1, keepdims=True)
+        self._history = None
+        self._pos = float(self.TAPS // 2 - 1)  # _history 先頭からの読み出し位置
+
+    def process(self, x: np.ndarray, ratio: float) -> np.ndarray:
+        """x: (frames, channels)。およそ frames * ratio 個の出力を返す。"""
+        center = self.TAPS // 2 - 1
+        if self._history is None or self._history.shape[1] != x.shape[1]:
+            self._history = np.zeros((self.TAPS - 1, x.shape[1]), dtype=np.float32)
+        buf = np.concatenate([self._history, x], axis=0)
+
+        last_valid = buf.shape[0] - (self.TAPS - center)  # タップがすべて実データに収まる最後の整数位置
+        count = int(np.floor((last_valid + 1 - 1e-9 - self._pos) * ratio)) + 1
+        if count <= 0:
+            self._history = buf
+            return x[:0]
+        positions = self._pos + np.arange(count) / ratio
+        positions = positions[positions < last_valid + 1]
+
+        whole = np.floor(positions).astype(np.int64)
+        phase = (positions - whole) * self.PHASES
+        p0 = phase.astype(np.int64)
+        blend = (phase - p0)[:, np.newaxis]
+        coefs = self._table[p0] * (1.0 - blend) + self._table[p0 + 1] * blend
+
+        windows = buf[(whole - center)[:, np.newaxis] + np.arange(self.TAPS)]  # (out, taps, channels)
+        out = np.einsum("ot,otc->oc", coefs, windows).astype(np.float32)
+
+        next_pos = self._pos + positions.shape[0] / ratio
+        keep_from = int(np.floor(next_pos)) - center
+        self._history = buf[keep_from:]
+        self._pos = next_pos - keep_from
+        return out
+
+
+class DriftController:
+    """バッファの残量を一定に保つ再生速度比を計算する PI 制御。
+
+    デバイスごとに水晶発振器の誤差があり、放置すると前後スピーカーが徐々にずれる。
+    残量は処理ブロックを受け取る直前の値(最小値)で測る。目標を全デバイス共通の時間にして
+    音切れの余裕を確保し、デバイス間の基準も揃える。
+    """
+
+    KP = 0.05      # 残量誤差 1秒あたりの比率
+    KI = 3e-4
+    EMA_TAU_S = 2.0
+
+    TARGET_S = 0.04
+
+    def __init__(self, rate: int, max_ppm: float = 1000.0, settle_s: float = 3.0):
+        self.rate = rate
+        self.max_ratio_offset = max_ppm * 1e-6
+        self.settle_s = settle_s
+        self.ratio = 1.0
+        self.target_frames = rate * self.TARGET_S
+        self._ema = None
+        self._elapsed = 0.0
+        self._integral = 0.0
+
+    def update(self, level_frames: int, block_frames: int) -> float:
+        dt = block_frames / self.rate
+        self._elapsed += dt
+        if self._ema is None:
+            self._ema = float(level_frames)
+        self._ema += (level_frames - self._ema) * min(1.0, dt / self.EMA_TAU_S)
+
+        if self._elapsed < self.settle_s:
+            return self.ratio
+
+        error_s = (self.target_frames - self._ema) / self.rate
+        limit = self.max_ratio_offset
+        self._integral = max(-limit, min(limit, self._integral + self.KI * error_s * dt))
+        self.ratio = 1.0 + max(-limit, min(limit, self.KP * error_s + self._integral))
+        return self.ratio
+
+
+class DriftCompensatedBuffer(_AudioBuffer):
+    """デバイス間のクロック差を、音を飛ばさず再生速度の微調整で吸収する出力バッファ。"""
+
+    def __init__(self, rate: int, max_frames: int | None = None, enabled: bool = True):
+        # 処理ブロック約46ms + 目標残量40ms を溜めてから再生を始める
+        super().__init__(prebuffer_frames=int(rate * 0.09), max_frames=max_frames)
+        self.enabled = enabled
+        self._controller = DriftController(rate)
+        self._resampler = _VariableRateResampler()
+
+    @property
+    def drift_ppm(self) -> float:
+        return (self._controller.ratio - 1.0) * 1e6
+
+    def put(self, data: np.ndarray) -> None:
+        if self.enabled and data.shape[0] > 0:
+            ratio = self._controller.update(self.buffered_frames(), data.shape[0])
+            data = self._resampler.process(data, ratio)
+        super().put(data)
+
+
 class HRTFFilter:
     """
     リアスピーカー知覚用のHRTF疑似3Dオーディオフィルタ。
@@ -814,6 +924,30 @@ def save_device_config(config: dict, filepath: str | Path = DEVICE_CONFIG_FILE) 
         _write_json_atomic(str(filepath), config)
     except Exception as e:
         print(f"[save_device_config] error: {e}", file=sys.stderr)
+
+
+# ==========================================
+# App Settings (音量・遅延・EQ などの自動保存)
+# ==========================================
+
+SETTINGS_FILE = _data_file("settings.json")
+
+
+def load_settings(filepath: str | Path = SETTINGS_FILE) -> dict:
+    """前回終了時の設定を読み込む。存在しない・壊れている場合は空の辞書を返す。"""
+    try:
+        with open(str(filepath), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings: dict, filepath: str | Path = SETTINGS_FILE) -> None:
+    try:
+        _write_json_atomic(str(filepath), settings)
+    except Exception as e:
+        print(f"[save_settings] error: {e}", file=sys.stderr)
 
 
 def _compute_rms(data: np.ndarray) -> float:
