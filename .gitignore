@@ -8,3 +8,6 @@ dist/
 
 # 環境ごとのデバイス設定
 device_config.json
+
+# 実行時に自動保存される設定
+settings.json
